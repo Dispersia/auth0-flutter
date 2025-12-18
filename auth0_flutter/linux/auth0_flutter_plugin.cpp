@@ -283,8 +283,18 @@ web::json::value exchangeCodeForTokens(
   return web::json::value::parse(bodyStr);
 }
 
-// -------------------- Method Call Handler --------------------
+// -------------------- Method Call Handlers --------------------
 
+// Handler for credentials_manager and auth channels (not implemented on Linux)
+void handle_not_implemented_method_call(FlMethodChannel* channel,
+                                       FlMethodCall* method_call,
+                                       gpointer user_data) {
+  g_autoptr(FlMethodResponse) response = nullptr;
+  response = FL_METHOD_RESPONSE(fl_method_not_implemented_response_new());
+  fl_method_call_respond(method_call, response, nullptr);
+}
+
+// Handler for web_auth channel
 void handle_method_call(FlMethodChannel* channel,
                        FlMethodCall* method_call,
                        gpointer user_data) {
@@ -400,12 +410,34 @@ void auth0_flutter_plugin_c_api_register_with_registrar(FlPluginRegistrar* regis
       g_object_new(auth0_flutter_plugin_get_type(), nullptr));
 
   g_autoptr(FlStandardMethodCodec) codec = fl_standard_method_codec_new();
+
+  // Register web_auth channel
   g_autoptr(FlMethodChannel) channel = fl_method_channel_new(
       fl_plugin_registrar_get_messenger(registrar),
       "auth0.com/auth0_flutter/web_auth",
       FL_METHOD_CODEC(codec));
   fl_method_channel_set_method_call_handler(
       channel, handle_method_call, g_object_ref(plugin), g_object_unref);
+
+  // Register credentials_manager channel (not implemented on Linux)
+  g_autoptr(FlStandardMethodCodec) credentials_codec = fl_standard_method_codec_new();
+  g_autoptr(FlMethodChannel) credentials_channel = fl_method_channel_new(
+      fl_plugin_registrar_get_messenger(registrar),
+      "auth0.com/auth0_flutter/credentials_manager",
+      FL_METHOD_CODEC(credentials_codec));
+  fl_method_channel_set_method_call_handler(
+      credentials_channel, handle_not_implemented_method_call,
+      g_object_ref(plugin), g_object_unref);
+
+  // Register auth API channel (not implemented on Linux)
+  g_autoptr(FlStandardMethodCodec) auth_codec = fl_standard_method_codec_new();
+  g_autoptr(FlMethodChannel) auth_channel = fl_method_channel_new(
+      fl_plugin_registrar_get_messenger(registrar),
+      "auth0.com/auth0_flutter/auth",
+      FL_METHOD_CODEC(auth_codec));
+  fl_method_channel_set_method_call_handler(
+      auth_channel, handle_not_implemented_method_call,
+      g_object_ref(plugin), g_object_unref);
 
   g_object_unref(plugin);
 }
