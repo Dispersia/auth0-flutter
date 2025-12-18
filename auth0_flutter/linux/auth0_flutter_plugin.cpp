@@ -39,6 +39,21 @@ void DebugPrint(const std::string& msg) {
   g_print("%s\n", msg.c_str());
 }
 
+// -------------------- In-Memory Credentials Storage --------------------
+
+struct StoredCredentials {
+  std::string accessToken;
+  std::string refreshToken;
+  std::string idToken;
+  std::string tokenType;
+  int64_t expiresAt;  // Unix timestamp in milliseconds
+  std::map<std::string, std::string> user;
+  std::vector<std::string> scopes;
+};
+
+// Simple in-memory storage (doesn't persist across app restarts)
+static std::map<std::string, StoredCredentials> credentialsStore;
+
 // -------------------- PKCE Helpers --------------------
 
 // Base64 URL-safe encode without padding
@@ -283,14 +298,181 @@ web::json::value exchangeCodeForTokens(
   return web::json::value::parse(bodyStr);
 }
 
+// -------------------- Credentials Manager Helpers --------------------
+
+std::string getStoreKey(FlValue* args) {
+  FlValue* account_value = fl_value_lookup_string(args, "_account");
+  if (account_value != nullptr && fl_value_get_type(account_value) == FL_VALUE_TYPE_MAP) {
+    FlValue* domain = fl_value_lookup_string(account_value, "domain");
+    FlValue* clientId = fl_value_lookup_string(account_value, "clientId");
+    if (domain != nullptr && clientId != nullptr) {
+      return std::string(fl_value_get_string(domain)) + ":" + std::string(fl_value_get_string(clientId));
+    }
+  }
+  return "default";
+}
+
+int64_t getCurrentTimeMs() {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+FlValue* credentialsToFlValue(const StoredCredentials& creds) {
+  g_autoptr(FlValue) result = fl_value_new_map();
+
+  fl_value_set_string_take(result, "accessToken", fl_value_new_string(creds.accessToken.c_str()));
+  fl_value_set_string_take(result, "tokenType", fl_value_new_string(creds.tokenType.c_str()));
+  fl_value_set_string_take(result, "expiresAt", fl_value_new_string(std::to_string(creds.expiresAt).c_str()));
+
+  if (!creds.refreshToken.empty()) {
+    fl_value_set_string_take(result, "refreshToken", fl_value_new_string(creds.refreshToken.c_str()));
+  }
+  if (!creds.idToken.empty()) {
+    fl_value_set_string_take(result, "idToken", fl_value_new_string(creds.idToken.c_str()));
+  }
+
+  if (!creds.scopes.empty()) {
+    g_autoptr(FlValue) scopes_list = fl_value_new_list();
+    for (const auto& scope : creds.scopes) {
+      fl_value_append_take(scopes_list, fl_value_new_string(scope.c_str()));
+    }
+    fl_value_set_string_take(result, "scopes", scopes_list);
+  }
+
+  if (!creds.user.empty()) {
+    g_autoptr(FlValue) user_map = fl_value_new_map();
+    for (const auto& [key, value] : creds.user) {
+      fl_value_set_string_take(user_map, key.c_str(), fl_value_new_string(value.c_str()));
+    }
+    fl_value_set_string_take(result, "user", user_map);
+  }
+
+  return fl_value_ref(result);
+}
+
+StoredCredentials parseCredentials(FlValue* creds_value) {
+  StoredCredentials creds;
+
+  FlValue* accessToken = fl_value_lookup_string(creds_value, "accessToken");
+  if (accessToken) creds.accessToken = fl_value_get_string(accessToken);
+
+  FlValue* refreshToken = fl_value_lookup_string(creds_value, "refreshToken");
+  if (refreshToken) creds.refreshToken = fl_value_get_string(refreshToken);
+
+  FlValue* idToken = fl_value_lookup_string(creds_value, "idToken");
+  if (idToken) creds.idToken = fl_value_get_string(idToken);
+
+  FlValue* tokenType = fl_value_lookup_string(creds_value, "tokenType");
+  if (tokenType) {
+    creds.tokenType = fl_value_get_string(tokenType);
+  } else {
+    creds.tokenType = "Bearer";
+  }
+
+  FlValue* expiresAt = fl_value_lookup_string(creds_value, "expiresAt");
+  if (expiresAt) {
+    const char* expiresAtStr = fl_value_get_string(expiresAt);
+    creds.expiresAt = std::stoll(expiresAtStr);
+  } else {
+    // Default to 1 hour from now
+    creds.expiresAt = getCurrentTimeMs() + (3600 * 1000);
+  }
+
+  return creds;
+}
+
 // -------------------- Method Call Handlers --------------------
 
-// Handler for credentials_manager and auth channels (not implemented on Linux)
-void handle_not_implemented_method_call(FlMethodChannel* channel,
-                                       FlMethodCall* method_call,
-                                       gpointer user_data) {
+// Handler for credentials_manager channel
+void handle_credentials_manager_method_call(FlMethodChannel* channel,
+                                           FlMethodCall* method_call,
+                                           gpointer user_data) {
   g_autoptr(FlMethodResponse) response = nullptr;
-  response = FL_METHOD_RESPONSE(fl_method_not_implemented_response_new());
+  const gchar* method = fl_method_call_get_name(method_call);
+  FlValue* args = fl_method_call_get_args(method_call);
+
+  if (fl_value_get_type(args) != FL_VALUE_TYPE_MAP) {
+    response = FL_METHOD_RESPONSE(fl_method_error_response_new(
+        "bad_args", "Expected a map as arguments", nullptr));
+    fl_method_call_respond(method_call, response, nullptr);
+    return;
+  }
+
+  std::string storeKey = getStoreKey(args);
+
+  if (strcmp(method, "credentialsManager#saveCredentials") == 0) {
+    FlValue* credentials = fl_value_lookup_string(args, "credentials");
+    if (credentials && fl_value_get_type(credentials) == FL_VALUE_TYPE_MAP) {
+      StoredCredentials creds = parseCredentials(credentials);
+      credentialsStore[storeKey] = creds;
+      response = FL_METHOD_RESPONSE(fl_method_success_response_new(fl_value_new_bool(true)));
+    } else {
+      response = FL_METHOD_RESPONSE(fl_method_error_response_new(
+          "bad_args", "Missing or invalid credentials", nullptr));
+    }
+  }
+  else if (strcmp(method, "credentialsManager#hasValidCredentials") == 0) {
+    bool hasValid = false;
+    auto it = credentialsStore.find(storeKey);
+    if (it != credentialsStore.end()) {
+      int64_t now = getCurrentTimeMs();
+      hasValid = it->second.expiresAt > now;
+    }
+    response = FL_METHOD_RESPONSE(fl_method_success_response_new(fl_value_new_bool(hasValid)));
+  }
+  else if (strcmp(method, "credentialsManager#getCredentials") == 0) {
+    auto it = credentialsStore.find(storeKey);
+    if (it != credentialsStore.end()) {
+      int64_t now = getCurrentTimeMs();
+      if (it->second.expiresAt > now) {
+        g_autoptr(FlValue) result = credentialsToFlValue(it->second);
+        response = FL_METHOD_RESPONSE(fl_method_success_response_new(result));
+      } else {
+        response = FL_METHOD_RESPONSE(fl_method_error_response_new(
+            "CREDENTIALS_EXPIRED", "Credentials have expired", nullptr));
+      }
+    } else {
+      response = FL_METHOD_RESPONSE(fl_method_error_response_new(
+          "NO_CREDENTIALS", "No credentials found", nullptr));
+    }
+  }
+  else if (strcmp(method, "credentialsManager#clearCredentials") == 0) {
+    credentialsStore.erase(storeKey);
+    response = FL_METHOD_RESPONSE(fl_method_success_response_new(fl_value_new_bool(true)));
+  }
+  else if (strcmp(method, "credentialsManager#renewCredentials") == 0) {
+    // For in-memory implementation, just return the existing credentials if valid
+    auto it = credentialsStore.find(storeKey);
+    if (it != credentialsStore.end()) {
+      int64_t now = getCurrentTimeMs();
+      if (it->second.expiresAt > now) {
+        g_autoptr(FlValue) result = credentialsToFlValue(it->second);
+        response = FL_METHOD_RESPONSE(fl_method_success_response_new(result));
+      } else {
+        response = FL_METHOD_RESPONSE(fl_method_error_response_new(
+            "RENEW_FAILED", "Credentials renewal not supported in-memory", nullptr));
+      }
+    } else {
+      response = FL_METHOD_RESPONSE(fl_method_error_response_new(
+          "NO_CREDENTIALS", "No credentials to renew", nullptr));
+    }
+  }
+  else {
+    response = FL_METHOD_RESPONSE(fl_method_not_implemented_response_new());
+  }
+
+  fl_method_call_respond(method_call, response, nullptr);
+}
+
+// Handler for auth API channel (not implemented on Linux)
+void handle_auth_api_method_call(FlMethodChannel* channel,
+                                 FlMethodCall* method_call,
+                                 gpointer user_data) {
+  g_autoptr(FlMethodResponse) response = nullptr;
+  response = FL_METHOD_RESPONSE(fl_method_error_response_new(
+      "UNSUPPORTED_PLATFORM",
+      "Auth API is not supported on Linux",
+      nullptr));
   fl_method_call_respond(method_call, response, nullptr);
 }
 
@@ -419,14 +601,14 @@ void auth0_flutter_plugin_c_api_register_with_registrar(FlPluginRegistrar* regis
   fl_method_channel_set_method_call_handler(
       channel, handle_method_call, g_object_ref(plugin), g_object_unref);
 
-  // Register credentials_manager channel (not implemented on Linux)
+  // Register credentials_manager channel (in-memory implementation)
   g_autoptr(FlStandardMethodCodec) credentials_codec = fl_standard_method_codec_new();
   g_autoptr(FlMethodChannel) credentials_channel = fl_method_channel_new(
       fl_plugin_registrar_get_messenger(registrar),
       "auth0.com/auth0_flutter/credentials_manager",
       FL_METHOD_CODEC(credentials_codec));
   fl_method_channel_set_method_call_handler(
-      credentials_channel, handle_not_implemented_method_call,
+      credentials_channel, handle_credentials_manager_method_call,
       g_object_ref(plugin), g_object_unref);
 
   // Register auth API channel (not implemented on Linux)
@@ -436,7 +618,7 @@ void auth0_flutter_plugin_c_api_register_with_registrar(FlPluginRegistrar* regis
       "auth0.com/auth0_flutter/auth",
       FL_METHOD_CODEC(auth_codec));
   fl_method_channel_set_method_call_handler(
-      auth_channel, handle_not_implemented_method_call,
+      auth_channel, handle_auth_api_method_call,
       g_object_ref(plugin), g_object_unref);
 
   g_object_unref(plugin);
