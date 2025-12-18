@@ -12,12 +12,14 @@
 #include <cstdlib>
 #include <cstring>
 
+// OpenSSL for PKCE and JWT parsing
 #include <openssl/sha.h>
 #include <openssl/rand.h>
 #include <openssl/bio.h>
 #include <openssl/evp.h>
 #include <openssl/buffer.h>
 
+// cpprestsdk
 #include <cpprest/http_listener.h>
 #include <cpprest/uri.h>
 #include <cpprest/http_client.h>
@@ -36,18 +38,28 @@ G_DEFINE_TYPE(Auth0FlutterPlugin, auth0_flutter_plugin, g_object_get_type())
 
 namespace {
 
+void DebugPrint(const std::string& msg) {
+  g_print("%s\n", msg.c_str());
+}
+
+// -------------------- In-Memory Credentials Storage --------------------
+
 struct StoredCredentials {
   std::string accessToken;
   std::string refreshToken;
   std::string idToken;
   std::string tokenType;
-  int64_t expiresAt;
+  int64_t expiresAt;  // Unix timestamp in milliseconds
   std::map<std::string, std::string> user;
   std::vector<std::string> scopes;
 };
 
+// Simple in-memory storage (doesn't persist across app restarts)
 static std::map<std::string, StoredCredentials> credentialsStore;
 
+// -------------------- PKCE Helpers --------------------
+
+// Base64 URL-safe encode without padding
 std::string base64UrlEncode(const std::vector<unsigned char>& data) {
     static const char* b64chars =
         "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -81,11 +93,13 @@ std::string base64UrlEncode(const std::vector<unsigned char>& data) {
         }
     }
 
+    // Make it URL-safe
     for (auto& c : result) {
         if (c == '+') c = '-';
         if (c == '/') c = '_';
     }
 
+    // Strip padding '='
     while (!result.empty() && result.back() == '=') {
         result.pop_back();
     }
@@ -93,6 +107,7 @@ std::string base64UrlEncode(const std::vector<unsigned char>& data) {
     return result;
 }
 
+// Generate random code verifier (32 bytes -> URL-safe string)
 std::string generateCodeVerifier() {
     std::vector<unsigned char> buffer(32);
     if (RAND_bytes(buffer.data(), static_cast<int>(buffer.size())) != 1) {
@@ -101,6 +116,7 @@ std::string generateCodeVerifier() {
     return base64UrlEncode(buffer);
 }
 
+// Generate code challenge from verifier (SHA256 + base64URL)
 std::string generateCodeChallenge(const std::string& verifier) {
     unsigned char hash[SHA256_DIGEST_LENGTH];
     SHA256(reinterpret_cast<const unsigned char*>(verifier.data()),
@@ -111,12 +127,17 @@ std::string generateCodeChallenge(const std::string& verifier) {
     return base64UrlEncode(digest);
 }
 
+// -------------------- JWT/ID Token Parsing --------------------
+
+// Base64 decode (URL-safe)
 std::vector<unsigned char> base64UrlDecode(const std::string& input) {
     std::string base64 = input;
+    // Convert URL-safe to standard base64
     for (auto& c : base64) {
         if (c == '-') c = '+';
         if (c == '_') c = '/';
     }
+    // Add padding if needed
     while (base64.length() % 4) {
         base64 += '=';
     }
@@ -136,7 +157,9 @@ std::vector<unsigned char> base64UrlDecode(const std::string& input) {
     return output;
 }
 
+// Parse ID token to extract user profile (simplified - doesn't validate signature)
 web::json::value parseIdToken(const std::string& idToken) {
+    // JWT format: header.payload.signature
     size_t firstDot = idToken.find('.');
     size_t secondDot = idToken.find('.', firstDot + 1);
 
@@ -151,6 +174,8 @@ web::json::value parseIdToken(const std::string& idToken) {
     return web::json::value::parse(utility::conversions::to_string_t(jsonStr));
 }
 
+// -------------------- Local Redirect Listener --------------------
+// Starts a local HTTP server to receive the OAuth callback
 std::string waitForAuthCode(const std::string& redirectUri) {
   uri u(utility::conversions::to_string_t(redirectUri));
   http_listener listener(u);
@@ -161,6 +186,7 @@ std::string waitForAuthCode(const std::string& redirectUri) {
   listener.support(methods::GET, [&](http_request request) {
     auto queries = uri::split_query(request.request_uri().query());
 
+    // Check for error first
     auto error_it = queries.find(U("error"));
     if (error_it != queries.end()) {
       error = utility::conversions::to_utf8string(error_it->second);
@@ -174,6 +200,7 @@ std::string waitForAuthCode(const std::string& redirectUri) {
       return;
     }
 
+    // Extract auth code
     auto it = queries.find(U("code"));
     if (it != queries.end()) {
       authCode = utility::conversions::to_utf8string(it->second);
@@ -189,10 +216,12 @@ std::string waitForAuthCode(const std::string& redirectUri) {
 
   try {
     listener.open().wait();
+    DebugPrint("HTTP listener started on: " + utility::conversions::to_utf8string(u.to_string()));
   } catch (const std::exception& e) {
     throw std::runtime_error(std::string("Failed to start HTTP listener: ") + e.what());
   }
 
+  // Wait for callback with timeout (3 minutes)
   int timeout_seconds = 180;
   int elapsed = 0;
   const int sleep_ms = 100;
@@ -215,6 +244,7 @@ std::string waitForAuthCode(const std::string& redirectUri) {
   return authCode;
 }
 
+// -------------------- Token Exchange --------------------
 web::json::value exchangeCodeForTokens(
     const std::string& domain,
     const std::string& clientId,
@@ -234,23 +264,40 @@ web::json::value exchangeCodeForTokens(
   body[U("code")] = web::json::value::string(utility::conversions::to_string_t(code));
   body[U("redirect_uri")] = web::json::value::string(utility::conversions::to_string_t(redirectUri));
   body[U("code_verifier")] = web::json::value::string(utility::conversions::to_string_t(codeVerifier));
+  DebugPrint("codeVerifier = " + codeVerifier);
+  DebugPrint("redirect_uri = " + redirectUri);
   request.set_body(body);
 
   auto response = client.request(request).get();
+
+  // ---- Debug: status & headers ----
+  DebugPrint("HTTP Status: " + std::to_string(response.status_code()));
+  for (const auto& h : response.headers()) {
+    DebugPrint("Header: " + utility::conversions::to_utf8string(h.first) +
+               " = " + utility::conversions::to_utf8string(h.second));
+  }
+
+  // ---- Read response body as string ----
   auto bodyStr = response.extract_string().get();
+  DebugPrint("Response Body: " + utility::conversions::to_utf8string(bodyStr));
 
   if (response.status_code() != status_codes::OK) {
     throw std::runtime_error("Token request failed: " + utility::conversions::to_utf8string(bodyStr));
   }
 
+  // ---- Parse JSON if successful ----
   return web::json::value::parse(bodyStr);
 }
 
+// -------------------- Token Response Conversion --------------------
+
+// Helper to get current time in milliseconds
 int64_t getCurrentTimeMs() {
   return std::chrono::duration_cast<std::chrono::milliseconds>(
       std::chrono::system_clock::now().time_since_epoch()).count();
 }
 
+// Convert timestamp to ISO 8601 string format
 std::string timestampToISO8601(int64_t timestampMs) {
   auto tp = std::chrono::system_clock::time_point(std::chrono::milliseconds(timestampMs));
   auto time_t = std::chrono::system_clock::to_time_t(tp);
@@ -265,19 +312,24 @@ std::string timestampToISO8601(int64_t timestampMs) {
   return oss.str();
 }
 
+// Convert Auth0 token response to Flutter credentials format
 FlValue* convertTokenResponseToCredentials(const web::json::value& tokenResponse) {
+  // Don't use g_autoptr since we're returning this and the caller takes ownership
   FlValue* result = fl_value_new_map();
 
+  // Extract tokens from response
   auto accessToken = tokenResponse.at(U("access_token")).as_string();
   auto idToken = tokenResponse.at(U("id_token")).as_string();
   auto tokenType = tokenResponse.has_field(U("token_type"))
       ? tokenResponse.at(U("token_type")).as_string()
       : U("Bearer");
 
+  // expires_in is in seconds, convert to ISO 8601 timestamp
   int64_t expiresIn = tokenResponse.at(U("expires_in")).as_integer();
   int64_t expiresAtMs = getCurrentTimeMs() + (expiresIn * 1000);
   std::string expiresAtISO = timestampToISO8601(expiresAtMs);
 
+  // Add required fields
   fl_value_set_string_take(result, "accessToken",
       fl_value_new_string(utility::conversions::to_utf8string(accessToken).c_str()));
   fl_value_set_string_take(result, "idToken",
@@ -287,12 +339,14 @@ FlValue* convertTokenResponseToCredentials(const web::json::value& tokenResponse
   fl_value_set_string_take(result, "expiresAt",
       fl_value_new_string(expiresAtISO.c_str()));
 
+  // Add refresh token if present
   if (tokenResponse.has_field(U("refresh_token"))) {
     auto refreshToken = tokenResponse.at(U("refresh_token")).as_string();
     fl_value_set_string_take(result, "refreshToken",
         fl_value_new_string(utility::conversions::to_utf8string(refreshToken).c_str()));
   }
 
+  // Parse scopes
   if (tokenResponse.has_field(U("scope"))) {
     auto scopeStr = utility::conversions::to_utf8string(tokenResponse.at(U("scope")).as_string());
     g_autoptr(FlValue) scopes_list = fl_value_new_list();
@@ -302,13 +356,16 @@ FlValue* convertTokenResponseToCredentials(const web::json::value& tokenResponse
     while (iss >> scope) {
       fl_value_append_take(scopes_list, fl_value_new_string(scope.c_str()));
     }
+    // Use g_steal_pointer to transfer ownership to avoid double-free
     fl_value_set_string_take(result, "scopes", g_steal_pointer(&scopes_list));
   }
 
+  // Parse user profile from ID token
   try {
     auto userProfile = parseIdToken(utility::conversions::to_utf8string(idToken));
     g_autoptr(FlValue) user_map = fl_value_new_map();
 
+    // Convert JSON object to FlValue map
     if (userProfile.is_object()) {
       for (auto it = userProfile.as_object().begin(); it != userProfile.as_object().end(); ++it) {
         auto key = utility::conversions::to_utf8string(it->first);
@@ -322,17 +379,24 @@ FlValue* convertTokenResponseToCredentials(const web::json::value& tokenResponse
         } else if (it->second.is_boolean()) {
           fl_value_set_string_take(user_map, key.c_str(), fl_value_new_bool(it->second.as_bool()));
         }
+        // Skip complex types for now
       }
     }
 
+    // Use g_steal_pointer to transfer ownership to avoid double-free
     fl_value_set_string_take(result, "userProfile", g_steal_pointer(&user_map));
-  } catch (const std::exception&) {
+  } catch (const std::exception& e) {
+    DebugPrint(std::string("Warning: Failed to parse user profile from ID token: ") + e.what());
+    // Add empty user profile
     g_autoptr(FlValue) empty_user = fl_value_new_map();
     fl_value_set_string_take(result, "userProfile", g_steal_pointer(&empty_user));
   }
 
+  // Return with ref count 1 - caller takes ownership
   return result;
 }
+
+// -------------------- Credentials Manager Helpers --------------------
 
 std::string getStoreKey(FlValue* args) {
   FlValue* account_value = fl_value_lookup_string(args, "_account");
@@ -346,6 +410,7 @@ std::string getStoreKey(FlValue* args) {
   return "default";
 }
 
+// Parse ISO 8601 timestamp to milliseconds
 int64_t parseISO8601ToMs(const std::string& isoStr) {
   std::tm tm = {};
   std::istringstream ss(isoStr);
@@ -357,8 +422,9 @@ int64_t parseISO8601ToMs(const std::string& isoStr) {
 
   auto tp = std::chrono::system_clock::from_time_t(timegm(&tm));
 
+  // Parse milliseconds if present
   if (ss.peek() == '.') {
-    ss.ignore();
+    ss.ignore(); // skip '.'
     int ms;
     ss >> ms;
     tp += std::chrono::milliseconds(ms);
@@ -373,6 +439,7 @@ FlValue* credentialsToFlValue(const StoredCredentials& creds) {
   fl_value_set_string_take(result, "accessToken", fl_value_new_string(creds.accessToken.c_str()));
   fl_value_set_string_take(result, "tokenType", fl_value_new_string(creds.tokenType.c_str()));
 
+  // Convert milliseconds timestamp back to ISO 8601
   std::string expiresAtISO = timestampToISO8601(creds.expiresAt);
   fl_value_set_string_take(result, "expiresAt", fl_value_new_string(expiresAtISO.c_str()));
 
@@ -427,17 +494,21 @@ StoredCredentials parseCredentials(FlValue* creds_value) {
     creds.tokenType = "Bearer";
   }
 
+  // Parse ISO 8601 timestamp to milliseconds
   FlValue* expiresAt = fl_value_lookup_string(creds_value, "expiresAt");
   if (expiresAt && fl_value_get_type(expiresAt) == FL_VALUE_TYPE_STRING) {
     const char* expiresAtStr = fl_value_get_string(expiresAt);
     creds.expiresAt = parseISO8601ToMs(expiresAtStr);
     if (creds.expiresAt == 0) {
+      // Parsing failed, default to 1 hour from now
       creds.expiresAt = getCurrentTimeMs() + (3600 * 1000);
     }
   } else {
+    // Default to 1 hour from now
     creds.expiresAt = getCurrentTimeMs() + (3600 * 1000);
   }
 
+  // Parse userProfile map
   FlValue* userProfile = fl_value_lookup_string(creds_value, "userProfile");
   if (userProfile && fl_value_get_type(userProfile) == FL_VALUE_TYPE_MAP) {
     size_t length = fl_value_get_length(userProfile);
@@ -451,6 +522,7 @@ StoredCredentials parseCredentials(FlValue* creds_value) {
     }
   }
 
+  // Parse scopes
   FlValue* scopes = fl_value_lookup_string(creds_value, "scopes");
   if (scopes && fl_value_get_type(scopes) == FL_VALUE_TYPE_LIST) {
     size_t length = fl_value_get_length(scopes);
@@ -465,6 +537,9 @@ StoredCredentials parseCredentials(FlValue* creds_value) {
   return creds;
 }
 
+// -------------------- Method Call Handlers --------------------
+
+// Handler for credentials_manager channel
 void handle_credentials_manager_method_call(FlMethodChannel* channel,
                                            FlMethodCall* method_call,
                                            gpointer user_data) {
@@ -482,18 +557,32 @@ void handle_credentials_manager_method_call(FlMethodChannel* channel,
   std::string storeKey = getStoreKey(args);
 
   if (strcmp(method, "credentialsManager#saveCredentials") == 0) {
+    DebugPrint("=== SaveCredentials Called ===");
+    DebugPrint("Store key: " + storeKey);
+
     FlValue* credentials = fl_value_lookup_string(args, "credentials");
+    DebugPrint("Credentials in args: " + std::to_string(credentials != nullptr));
+
+    if (credentials) {
+      DebugPrint("Credentials type: " + std::to_string(fl_value_get_type(credentials)));
+    }
 
     if (credentials && fl_value_get_type(credentials) == FL_VALUE_TYPE_MAP) {
       try {
         StoredCredentials creds = parseCredentials(credentials);
         credentialsStore[storeKey] = creds;
+        DebugPrint("=== Saved Credentials Successfully ===");
+        DebugPrint("Store key: " + storeKey);
+        DebugPrint("Expires at (ms): " + std::to_string(creds.expiresAt));
+        DebugPrint("Has user data: " + std::to_string(!creds.user.empty()));
         response = FL_METHOD_RESPONSE(fl_method_success_response_new(fl_value_new_bool(true)));
       } catch (const std::exception& e) {
+        DebugPrint("ERROR parsing credentials: " + std::string(e.what()));
         response = FL_METHOD_RESPONSE(fl_method_error_response_new(
             "parse_error", e.what(), nullptr));
       }
     } else {
+      DebugPrint("ERROR: Missing or invalid credentials");
       response = FL_METHOD_RESPONSE(fl_method_error_response_new(
           "bad_args", "Missing or invalid credentials", nullptr));
     }
@@ -501,9 +590,15 @@ void handle_credentials_manager_method_call(FlMethodChannel* channel,
   else if (strcmp(method, "credentialsManager#hasValidCredentials") == 0) {
     bool hasValid = false;
     auto it = credentialsStore.find(storeKey);
+    DebugPrint("=== Checking Valid Credentials ===");
+    DebugPrint("Store key: " + storeKey);
+    DebugPrint("Found in store: " + std::to_string(it != credentialsStore.end()));
     if (it != credentialsStore.end()) {
       int64_t now = getCurrentTimeMs();
       hasValid = it->second.expiresAt > now;
+      DebugPrint("Expires at (ms): " + std::to_string(it->second.expiresAt));
+      DebugPrint("Current time (ms): " + std::to_string(now));
+      DebugPrint("Is valid: " + std::to_string(hasValid));
     }
     response = FL_METHOD_RESPONSE(fl_method_success_response_new(fl_value_new_bool(hasValid)));
   }
@@ -528,6 +623,7 @@ void handle_credentials_manager_method_call(FlMethodChannel* channel,
     response = FL_METHOD_RESPONSE(fl_method_success_response_new(fl_value_new_bool(true)));
   }
   else if (strcmp(method, "credentialsManager#renewCredentials") == 0) {
+    // For in-memory implementation, just return the existing credentials if valid
     auto it = credentialsStore.find(storeKey);
     if (it != credentialsStore.end()) {
       int64_t now = getCurrentTimeMs();
@@ -550,6 +646,7 @@ void handle_credentials_manager_method_call(FlMethodChannel* channel,
   fl_method_call_respond(method_call, response, nullptr);
 }
 
+// Handler for auth API channel (not implemented on Linux)
 void handle_auth_api_method_call(FlMethodChannel* channel,
                                  FlMethodCall* method_call,
                                  gpointer user_data) {
@@ -561,6 +658,7 @@ void handle_auth_api_method_call(FlMethodChannel* channel,
   fl_method_call_respond(method_call, response, nullptr);
 }
 
+// Handler for web_auth channel
 void handle_method_call(FlMethodChannel* channel,
                        FlMethodCall* method_call,
                        gpointer user_data) {
@@ -570,6 +668,7 @@ void handle_method_call(FlMethodChannel* channel,
   FlValue* args = fl_method_call_get_args(method_call);
 
   if (strcmp(method, "webAuth#login") == 0) {
+    // Extract "account" map from args
     if (fl_value_get_type(args) != FL_VALUE_TYPE_MAP) {
       response = FL_METHOD_RESPONSE(fl_method_error_response_new(
           "bad_args", "Expected a map as arguments", nullptr));
@@ -586,6 +685,7 @@ void handle_method_call(FlMethodChannel* channel,
       return;
     }
 
+    // Extract clientId and domain
     FlValue* client_id_value = fl_value_lookup_string(account_value, "clientId");
     FlValue* domain_value = fl_value_lookup_string(account_value, "domain");
 
@@ -610,9 +710,13 @@ void handle_method_call(FlMethodChannel* channel,
     std::string redirectUri = "http://localhost:8081/callback";
 
     try {
+      // 1. PKCE
       std::string codeVerifier = generateCodeVerifier();
       std::string codeChallenge = generateCodeChallenge(codeVerifier);
+      DebugPrint("codeVerifier = " + codeVerifier);
+      DebugPrint("codeChallenge = " + codeChallenge);
 
+      // 2. Build Auth URL with URL-encoded redirect_uri
       std::ostringstream authUrl;
       authUrl << "https://" << domain << "/authorize?"
               << "response_type=code"
@@ -621,7 +725,9 @@ void handle_method_call(FlMethodChannel* channel,
               << "&scope=openid%20profile%20email"
               << "&code_challenge=" << codeChallenge
               << "&code_challenge_method=S256";
+      DebugPrint("authUrl = " + authUrl.str());
 
+      // 3. Start local HTTP server first (in a separate thread to avoid blocking)
       std::string code;
       std::exception_ptr callback_exception = nullptr;
 
@@ -633,13 +739,20 @@ void handle_method_call(FlMethodChannel* channel,
         }
       });
 
+      // Give the server a moment to start
       std::this_thread::sleep_for(std::chrono::milliseconds(500));
 
+      // 4. Open browser using xdg-open
       std::string openCommand = "xdg-open '" + authUrl.str() + "'";
-      system(openCommand.c_str());
+      int result = system(openCommand.c_str());
+      if (result != 0) {
+        DebugPrint("Warning: xdg-open returned non-zero exit code");
+      }
 
+      // 5. Wait for the listener thread to complete
       listener_thread.join();
 
+      // Check if callback thread threw an exception
       if (callback_exception) {
         std::rethrow_exception(callback_exception);
       }
@@ -648,10 +761,40 @@ void handle_method_call(FlMethodChannel* channel,
         throw std::runtime_error("Failed to receive authorization code");
       }
 
-      auto tokens = exchangeCodeForTokens(domain, clientId, redirectUri, code, codeVerifier);
+      // 6. Exchange code for tokens
+      auto tokens =
+          exchangeCodeForTokens(domain, clientId, redirectUri, code, codeVerifier);
+
+      // 7. Convert to Flutter credentials format (same as Android/iOS)
+      // Don't use g_autoptr here because fl_method_success_response_new takes ownership
       FlValue* credentials = convertTokenResponseToCredentials(tokens);
 
+      // Debug: Print the credentials map structure
+      DebugPrint("=== Credentials Map Debug ===");
+      DebugPrint("accessToken: " + std::string(fl_value_get_string(fl_value_lookup_string(credentials, "accessToken")) ?: "NULL"));
+      DebugPrint("idToken: " + std::string(fl_value_get_string(fl_value_lookup_string(credentials, "idToken")) ?: "NULL"));
+      DebugPrint("tokenType: " + std::string(fl_value_get_string(fl_value_lookup_string(credentials, "tokenType")) ?: "NULL"));
+      DebugPrint("expiresAt: " + std::string(fl_value_get_string(fl_value_lookup_string(credentials, "expiresAt")) ?: "NULL"));
+
+      FlValue* userProfile = fl_value_lookup_string(credentials, "userProfile");
+      if (userProfile) {
+        DebugPrint("userProfile exists, type: " + std::to_string(fl_value_get_type(userProfile)));
+      } else {
+        DebugPrint("userProfile: NULL");
+      }
+
+      FlValue* scopes = fl_value_lookup_string(credentials, "scopes");
+      if (scopes) {
+        DebugPrint("scopes exists, type: " + std::to_string(fl_value_get_type(scopes)));
+      } else {
+        DebugPrint("scopes: NULL");
+      }
+      DebugPrint("=== End Credentials Debug ===");
+
+      // fl_method_success_response_new takes ownership of credentials
+      DebugPrint("Creating success response...");
       response = FL_METHOD_RESPONSE(fl_method_success_response_new(credentials));
+      DebugPrint("Success response created, sending to Dart...");
     } catch (const std::exception& e) {
       response = FL_METHOD_RESPONSE(fl_method_error_response_new(
           "auth_failed", e.what(), nullptr));
@@ -660,10 +803,14 @@ void handle_method_call(FlMethodChannel* channel,
     response = FL_METHOD_RESPONSE(fl_method_not_implemented_response_new());
   }
 
+  DebugPrint("Responding to method call...");
   fl_method_call_respond(method_call, response, nullptr);
+  DebugPrint("Response sent successfully");
 }
 
-}
+}  // namespace
+
+// -------------------- GObject Implementation --------------------
 
 static void auth0_flutter_plugin_dispose(GObject* object) {
   G_OBJECT_CLASS(auth0_flutter_plugin_parent_class)->dispose(object);
@@ -681,6 +828,7 @@ void auth0_flutter_plugin_c_api_register_with_registrar(FlPluginRegistrar* regis
 
   g_autoptr(FlStandardMethodCodec) codec = fl_standard_method_codec_new();
 
+  // Register web_auth channel
   g_autoptr(FlMethodChannel) channel = fl_method_channel_new(
       fl_plugin_registrar_get_messenger(registrar),
       "auth0.com/auth0_flutter/web_auth",
@@ -688,6 +836,7 @@ void auth0_flutter_plugin_c_api_register_with_registrar(FlPluginRegistrar* regis
   fl_method_channel_set_method_call_handler(
       channel, handle_method_call, g_object_ref(plugin), g_object_unref);
 
+  // Register credentials_manager channel (in-memory implementation)
   g_autoptr(FlStandardMethodCodec) credentials_codec = fl_standard_method_codec_new();
   g_autoptr(FlMethodChannel) credentials_channel = fl_method_channel_new(
       fl_plugin_registrar_get_messenger(registrar),
@@ -697,6 +846,7 @@ void auth0_flutter_plugin_c_api_register_with_registrar(FlPluginRegistrar* regis
       credentials_channel, handle_credentials_manager_method_call,
       g_object_ref(plugin), g_object_unref);
 
+  // Register auth API channel (not implemented on Linux)
   g_autoptr(FlStandardMethodCodec) auth_codec = fl_standard_method_codec_new();
   g_autoptr(FlMethodChannel) auth_channel = fl_method_channel_new(
       fl_plugin_registrar_get_messenger(registrar),
