@@ -50,6 +50,8 @@ target_include_directories(${PLUGIN_NAME} INTERFACE
 # === Dependencies ===
 find_package(cpprestsdk CONFIG REQUIRED)
 find_package(OpenSSL REQUIRED)
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(LIBSECRET REQUIRED libsecret-1)
 
 # Find Boost manually for compatibility with system packages
 # Note: boost_system is header-only in Boost 1.69+
@@ -66,9 +68,13 @@ target_link_libraries(${PLUGIN_NAME} PRIVATE
   OpenSSL::Crypto
   ${BOOST_DATE_TIME_LIB}
   ${BOOST_REGEX_LIB}
+  ${LIBSECRET_LIBRARIES}
 )
 
-target_include_directories(${PLUGIN_NAME} PRIVATE ${BOOST_INCLUDE_DIR})
+target_include_directories(${PLUGIN_NAME} PRIVATE
+  ${BOOST_INCLUDE_DIR}
+  ${LIBSECRET_INCLUDE_DIRS}
+)
 
 # List of absolute paths to libraries that should be bundled with the plugin.
 set(auth0_flutter_bundled_libraries

@@ -2,6 +2,7 @@
 
 #include <flutter_linux/flutter_linux.h>
 #include <gtk/gtk.h>
+#include <libsecret/secret.h>
 
 #include <memory>
 #include <sstream>
@@ -46,7 +47,15 @@ struct StoredCredentials {
   std::vector<std::string> scopes;
 };
 
-static std::map<std::string, StoredCredentials> credentialsStore;
+// libsecret schema for Auth0 credentials
+static const SecretSchema auth0_credentials_schema = {
+  "com.auth0.flutter.credentials",
+  SECRET_SCHEMA_NONE,
+  {
+    { "account", SECRET_SCHEMA_ATTRIBUTE_STRING },
+    { nullptr, SECRET_SCHEMA_ATTRIBUTE_STRING }
+  }
+};
 
 std::string base64UrlEncode(const std::vector<unsigned char>& data) {
     static const char* b64chars =
@@ -465,6 +474,80 @@ StoredCredentials parseCredentials(FlValue* creds_value) {
   return creds;
 }
 
+std::string serializeCredentials(const StoredCredentials& creds) {
+  web::json::value json = web::json::value::object();
+  json[U("accessToken")] = web::json::value::string(utility::conversions::to_string_t(creds.accessToken));
+  json[U("tokenType")] = web::json::value::string(utility::conversions::to_string_t(creds.tokenType));
+  json[U("expiresAt")] = web::json::value::number(creds.expiresAt);
+
+  if (!creds.refreshToken.empty()) {
+    json[U("refreshToken")] = web::json::value::string(utility::conversions::to_string_t(creds.refreshToken));
+  }
+  if (!creds.idToken.empty()) {
+    json[U("idToken")] = web::json::value::string(utility::conversions::to_string_t(creds.idToken));
+  }
+
+  if (!creds.scopes.empty()) {
+    web::json::value scopes_array = web::json::value::array();
+    for (size_t i = 0; i < creds.scopes.size(); i++) {
+      scopes_array[i] = web::json::value::string(utility::conversions::to_string_t(creds.scopes[i]));
+    }
+    json[U("scopes")] = scopes_array;
+  }
+
+  if (!creds.user.empty()) {
+    web::json::value user_obj = web::json::value::object();
+    for (const auto& [key, value] : creds.user) {
+      user_obj[utility::conversions::to_string_t(key)] =
+        web::json::value::string(utility::conversions::to_string_t(value));
+    }
+    json[U("user")] = user_obj;
+  }
+
+  return utility::conversions::to_utf8string(json.serialize());
+}
+
+StoredCredentials deserializeCredentials(const std::string& jsonStr) {
+  StoredCredentials creds;
+
+  auto json = web::json::value::parse(utility::conversions::to_string_t(jsonStr));
+
+  if (json.has_field(U("accessToken"))) {
+    creds.accessToken = utility::conversions::to_utf8string(json[U("accessToken")].as_string());
+  }
+  if (json.has_field(U("refreshToken"))) {
+    creds.refreshToken = utility::conversions::to_utf8string(json[U("refreshToken")].as_string());
+  }
+  if (json.has_field(U("idToken"))) {
+    creds.idToken = utility::conversions::to_utf8string(json[U("idToken")].as_string());
+  }
+  if (json.has_field(U("tokenType"))) {
+    creds.tokenType = utility::conversions::to_utf8string(json[U("tokenType")].as_string());
+  } else {
+    creds.tokenType = "Bearer";
+  }
+  if (json.has_field(U("expiresAt"))) {
+    creds.expiresAt = json[U("expiresAt")].as_number().to_int64();
+  }
+
+  if (json.has_field(U("scopes")) && json[U("scopes")].is_array()) {
+    auto scopes_array = json[U("scopes")].as_array();
+    for (const auto& scope : scopes_array) {
+      creds.scopes.push_back(utility::conversions::to_utf8string(scope.as_string()));
+    }
+  }
+
+  if (json.has_field(U("user")) && json[U("user")].is_object()) {
+    auto user_obj = json[U("user")].as_object();
+    for (const auto& [key, value] : user_obj) {
+      creds.user[utility::conversions::to_utf8string(key)] =
+        utility::conversions::to_utf8string(value.as_string());
+    }
+  }
+
+  return creds;
+}
+
 void handle_credentials_manager_method_call(FlMethodChannel* channel,
                                            FlMethodCall* method_call,
                                            gpointer user_data) {
@@ -487,8 +570,30 @@ void handle_credentials_manager_method_call(FlMethodChannel* channel,
     if (credentials && fl_value_get_type(credentials) == FL_VALUE_TYPE_MAP) {
       try {
         StoredCredentials creds = parseCredentials(credentials);
-        credentialsStore[storeKey] = creds;
-        response = FL_METHOD_RESPONSE(fl_method_success_response_new(fl_value_new_bool(true)));
+        std::string serialized = serializeCredentials(creds);
+
+        GError* error = nullptr;
+        gboolean result = secret_password_store_sync(
+            &auth0_credentials_schema,
+            SECRET_COLLECTION_DEFAULT,
+            storeKey.c_str(),
+            serialized.c_str(),
+            nullptr,
+            &error,
+            "account", storeKey.c_str(),
+            nullptr);
+
+        if (error != nullptr) {
+          std::string error_msg = error->message;
+          g_error_free(error);
+          response = FL_METHOD_RESPONSE(fl_method_error_response_new(
+              "storage_error", error_msg.c_str(), nullptr));
+        } else if (result) {
+          response = FL_METHOD_RESPONSE(fl_method_success_response_new(fl_value_new_bool(true)));
+        } else {
+          response = FL_METHOD_RESPONSE(fl_method_error_response_new(
+              "storage_error", "Failed to store credentials", nullptr));
+        }
       } catch (const std::exception& e) {
         response = FL_METHOD_RESPONSE(fl_method_error_response_new(
             "parse_error", e.what(), nullptr));
@@ -500,45 +605,113 @@ void handle_credentials_manager_method_call(FlMethodChannel* channel,
   }
   else if (strcmp(method, "credentialsManager#hasValidCredentials") == 0) {
     bool hasValid = false;
-    auto it = credentialsStore.find(storeKey);
-    if (it != credentialsStore.end()) {
-      int64_t now = getCurrentTimeMs();
-      hasValid = it->second.expiresAt > now;
+    GError* error = nullptr;
+    gchar* password = secret_password_lookup_sync(
+        &auth0_credentials_schema,
+        nullptr,
+        &error,
+        "account", storeKey.c_str(),
+        nullptr);
+
+    if (password != nullptr) {
+      try {
+        StoredCredentials creds = deserializeCredentials(std::string(password));
+        int64_t now = getCurrentTimeMs();
+        hasValid = creds.expiresAt > now;
+      } catch (const std::exception&) {
+        hasValid = false;
+      }
+      secret_password_free(password);
     }
+
+    if (error != nullptr) {
+      g_error_free(error);
+    }
+
     response = FL_METHOD_RESPONSE(fl_method_success_response_new(fl_value_new_bool(hasValid)));
   }
   else if (strcmp(method, "credentialsManager#getCredentials") == 0) {
-    auto it = credentialsStore.find(storeKey);
-    if (it != credentialsStore.end()) {
-      int64_t now = getCurrentTimeMs();
-      if (it->second.expiresAt > now) {
-        g_autoptr(FlValue) result = credentialsToFlValue(it->second);
-        response = FL_METHOD_RESPONSE(fl_method_success_response_new(result));
-      } else {
+    GError* error = nullptr;
+    gchar* password = secret_password_lookup_sync(
+        &auth0_credentials_schema,
+        nullptr,
+        &error,
+        "account", storeKey.c_str(),
+        nullptr);
+
+    if (password != nullptr) {
+      try {
+        StoredCredentials creds = deserializeCredentials(std::string(password));
+        int64_t now = getCurrentTimeMs();
+        if (creds.expiresAt > now) {
+          g_autoptr(FlValue) result = credentialsToFlValue(creds);
+          response = FL_METHOD_RESPONSE(fl_method_success_response_new(result));
+        } else {
+          response = FL_METHOD_RESPONSE(fl_method_error_response_new(
+              "CREDENTIALS_EXPIRED", "Credentials have expired", nullptr));
+        }
+        secret_password_free(password);
+      } catch (const std::exception& e) {
+        secret_password_free(password);
         response = FL_METHOD_RESPONSE(fl_method_error_response_new(
-            "CREDENTIALS_EXPIRED", "Credentials have expired", nullptr));
+            "parse_error", e.what(), nullptr));
       }
     } else {
+      if (error != nullptr) {
+        g_error_free(error);
+      }
       response = FL_METHOD_RESPONSE(fl_method_error_response_new(
           "NO_CREDENTIALS", "No credentials found", nullptr));
     }
   }
   else if (strcmp(method, "credentialsManager#clearCredentials") == 0) {
-    credentialsStore.erase(storeKey);
-    response = FL_METHOD_RESPONSE(fl_method_success_response_new(fl_value_new_bool(true)));
+    GError* error = nullptr;
+    secret_password_clear_sync(
+        &auth0_credentials_schema,
+        nullptr,
+        &error,
+        "account", storeKey.c_str(),
+        nullptr);
+
+    if (error != nullptr) {
+      std::string error_msg = error->message;
+      g_error_free(error);
+      response = FL_METHOD_RESPONSE(fl_method_error_response_new(
+          "storage_error", error_msg.c_str(), nullptr));
+    } else {
+      response = FL_METHOD_RESPONSE(fl_method_success_response_new(fl_value_new_bool(true)));
+    }
   }
   else if (strcmp(method, "credentialsManager#renewCredentials") == 0) {
-    auto it = credentialsStore.find(storeKey);
-    if (it != credentialsStore.end()) {
-      int64_t now = getCurrentTimeMs();
-      if (it->second.expiresAt > now) {
-        g_autoptr(FlValue) result = credentialsToFlValue(it->second);
-        response = FL_METHOD_RESPONSE(fl_method_success_response_new(result));
-      } else {
+    GError* error = nullptr;
+    gchar* password = secret_password_lookup_sync(
+        &auth0_credentials_schema,
+        nullptr,
+        &error,
+        "account", storeKey.c_str(),
+        nullptr);
+
+    if (password != nullptr) {
+      try {
+        StoredCredentials creds = deserializeCredentials(std::string(password));
+        int64_t now = getCurrentTimeMs();
+        if (creds.expiresAt > now) {
+          g_autoptr(FlValue) result = credentialsToFlValue(creds);
+          response = FL_METHOD_RESPONSE(fl_method_success_response_new(result));
+        } else {
+          response = FL_METHOD_RESPONSE(fl_method_error_response_new(
+              "RENEW_FAILED", "Credentials renewal not supported", nullptr));
+        }
+        secret_password_free(password);
+      } catch (const std::exception& e) {
+        secret_password_free(password);
         response = FL_METHOD_RESPONSE(fl_method_error_response_new(
-            "RENEW_FAILED", "Credentials renewal not supported in-memory", nullptr));
+            "parse_error", e.what(), nullptr));
       }
     } else {
+      if (error != nullptr) {
+        g_error_free(error);
+      }
       response = FL_METHOD_RESPONSE(fl_method_error_response_new(
           "NO_CREDENTIALS", "No credentials to renew", nullptr));
     }
