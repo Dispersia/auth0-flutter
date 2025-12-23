@@ -780,7 +780,7 @@ void handle_method_call(FlMethodChannel* channel,
 
     std::string clientId = fl_value_get_string(client_id_value);
     std::string domain = fl_value_get_string(domain_value);
-    std::string redirectUri = "http://localhost:8081/callback";
+    std::string redirectUri = "http://localhost:43828/callback";
 
     try {
       std::string codeVerifier = generateCodeVerifier();
@@ -790,7 +790,7 @@ void handle_method_call(FlMethodChannel* channel,
       authUrl << "https://" << domain << "/authorize?"
               << "response_type=code"
               << "&client_id=" << clientId
-              << "&redirect_uri=http%3A%2F%2Flocalhost%3A8081%2Fcallback"
+              << "&redirect_uri=http%3A%2F%2Flocalhost%3A43828%2Fcallback"
               << "&scope=openid%20profile%20email"
               << "&code_challenge=" << codeChallenge
               << "&code_challenge_method=S256";
