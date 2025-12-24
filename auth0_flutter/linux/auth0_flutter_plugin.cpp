@@ -4,6 +4,7 @@
 #include <gtk/gtk.h>
 #include <libsecret/secret.h>
 
+#include <atomic>
 #include <memory>
 #include <sstream>
 #include <thread>
@@ -46,6 +47,21 @@ struct StoredCredentials {
   std::map<std::string, std::string> user;
   std::vector<std::string> scopes;
 };
+
+// Struct to pass async response back to main thread
+struct AsyncResponse {
+  FlMethodCall* method_call;
+  FlMethodResponse* response;
+};
+
+gboolean send_async_response(gpointer user_data) {
+  AsyncResponse* data = static_cast<AsyncResponse*>(user_data);
+  fl_method_call_respond(data->method_call, data->response, nullptr);
+  g_object_unref(data->method_call);
+  g_object_unref(data->response);
+  delete data;
+  return G_SOURCE_REMOVE;
+}
 
 // libsecret schema for Auth0 credentials
 static const SecretSchema auth0_credentials_schema = {
@@ -782,53 +798,189 @@ void handle_method_call(FlMethodChannel* channel,
     std::string domain = fl_value_get_string(domain_value);
     std::string redirectUri = "http://localhost:43828/callback";
 
-    try {
-      std::string codeVerifier = generateCodeVerifier();
-      std::string codeChallenge = generateCodeChallenge(codeVerifier);
+    // Keep reference to method_call for async response
+    g_object_ref(method_call);
 
-      std::ostringstream authUrl;
-      authUrl << "https://" << domain << "/authorize?"
-              << "response_type=code"
-              << "&client_id=" << clientId
-              << "&redirect_uri=http%3A%2F%2Flocalhost%3A43828%2Fcallback"
-              << "&scope=openid%20profile%20email"
-              << "&code_challenge=" << codeChallenge
-              << "&code_challenge_method=S256";
+    // Run login in background thread
+    std::thread([method_call, clientId, domain, redirectUri]() {
+      FlMethodResponse* async_response = nullptr;
 
-      std::string code;
-      std::exception_ptr callback_exception = nullptr;
+      try {
+        std::string codeVerifier = generateCodeVerifier();
+        std::string codeChallenge = generateCodeChallenge(codeVerifier);
 
-      std::thread listener_thread([&]() {
-        try {
-          code = waitForAuthCode(redirectUri);
-        } catch (...) {
-          callback_exception = std::current_exception();
+        std::ostringstream authUrl;
+        authUrl << "https://" << domain << "/authorize?"
+                << "response_type=code"
+                << "&client_id=" << clientId
+                << "&redirect_uri=http%3A%2F%2Flocalhost%3A43828%2Fcallback"
+                << "&scope=openid%20profile%20email"
+                << "&code_challenge=" << codeChallenge
+                << "&code_challenge_method=S256";
+
+        std::string code;
+        std::exception_ptr callback_exception = nullptr;
+
+        std::thread listener_thread([&]() {
+          try {
+            code = waitForAuthCode(redirectUri);
+          } catch (...) {
+            callback_exception = std::current_exception();
+          }
+        });
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
+        std::string openCommand = "xdg-open '" + authUrl.str() + "'";
+        system(openCommand.c_str());
+
+        listener_thread.join();
+
+        if (callback_exception) {
+          std::rethrow_exception(callback_exception);
         }
-      });
 
-      std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        if (code.empty()) {
+          throw std::runtime_error("Failed to receive authorization code");
+        }
 
-      std::string openCommand = "xdg-open '" + authUrl.str() + "'";
-      system(openCommand.c_str());
+        auto tokens = exchangeCodeForTokens(domain, clientId, redirectUri, code, codeVerifier);
+        FlValue* credentials = convertTokenResponseToCredentials(tokens);
 
-      listener_thread.join();
-
-      if (callback_exception) {
-        std::rethrow_exception(callback_exception);
+        async_response = FL_METHOD_RESPONSE(fl_method_success_response_new(credentials));
+      } catch (const std::exception& e) {
+        async_response = FL_METHOD_RESPONSE(fl_method_error_response_new(
+            "auth_failed", e.what(), nullptr));
       }
 
-      if (code.empty()) {
-        throw std::runtime_error("Failed to receive authorization code");
-      }
+      // Send response back on main thread
+      AsyncResponse* data = new AsyncResponse{method_call, async_response};
+      g_idle_add(send_async_response, data);
+    }).detach();
 
-      auto tokens = exchangeCodeForTokens(domain, clientId, redirectUri, code, codeVerifier);
-      FlValue* credentials = convertTokenResponseToCredentials(tokens);
-
-      response = FL_METHOD_RESPONSE(fl_method_success_response_new(credentials));
-    } catch (const std::exception& e) {
+    return; // Don't respond synchronously
+  } else if (strcmp(method, "webAuth#logout") == 0) {
+    if (fl_value_get_type(args) != FL_VALUE_TYPE_MAP) {
       response = FL_METHOD_RESPONSE(fl_method_error_response_new(
-          "auth_failed", e.what(), nullptr));
+          "bad_args", "Expected a map as arguments", nullptr));
+      fl_method_call_respond(method_call, response, nullptr);
+      return;
     }
+
+    FlValue* account_value = fl_value_lookup_string(args, "_account");
+    if (account_value == nullptr ||
+        fl_value_get_type(account_value) != FL_VALUE_TYPE_MAP) {
+      response = FL_METHOD_RESPONSE(fl_method_error_response_new(
+          "bad_args", "Missing or invalid '_account' key", nullptr));
+      fl_method_call_respond(method_call, response, nullptr);
+      return;
+    }
+
+    FlValue* client_id_value = fl_value_lookup_string(account_value, "clientId");
+    FlValue* domain_value = fl_value_lookup_string(account_value, "domain");
+
+    if (client_id_value == nullptr ||
+        fl_value_get_type(client_id_value) != FL_VALUE_TYPE_STRING) {
+      response = FL_METHOD_RESPONSE(fl_method_error_response_new(
+          "bad_args", "Missing or invalid 'clientId'", nullptr));
+      fl_method_call_respond(method_call, response, nullptr);
+      return;
+    }
+
+    if (domain_value == nullptr ||
+        fl_value_get_type(domain_value) != FL_VALUE_TYPE_STRING) {
+      response = FL_METHOD_RESPONSE(fl_method_error_response_new(
+          "bad_args", "Missing or invalid 'domain'", nullptr));
+      fl_method_call_respond(method_call, response, nullptr);
+      return;
+    }
+
+    std::string clientId = fl_value_get_string(client_id_value);
+    std::string domain = fl_value_get_string(domain_value);
+    std::string storeKey = getStoreKey(args);
+
+    // Check for federated logout before entering thread
+    FlValue* federated_value = fl_value_lookup_string(args, "federated");
+    bool federated = federated_value != nullptr &&
+                     fl_value_get_type(federated_value) == FL_VALUE_TYPE_BOOL &&
+                     fl_value_get_bool(federated_value);
+
+    // Keep reference to method_call for async response
+    g_object_ref(method_call);
+
+    // Run logout in background thread
+    std::thread([method_call, clientId, domain, storeKey, federated]() {
+      FlMethodResponse* async_response = nullptr;
+
+      try {
+        // Clear stored credentials
+        GError* error = nullptr;
+        secret_password_clear_sync(
+            &auth0_credentials_schema,
+            nullptr,
+            &error,
+            "account", storeKey.c_str(),
+            nullptr);
+
+        if (error != nullptr) {
+          g_error_free(error);
+        }
+
+        // Set up logout callback URL (same port as login)
+        std::string logoutCallbackUri = "http://localhost:43828/logout";
+
+        // Start a simple HTTP listener for the logout callback
+        uri callback_uri(utility::conversions::to_string_t(logoutCallbackUri));
+        http_listener logout_listener(callback_uri);
+
+        std::atomic<bool> callback_received{false};
+
+        logout_listener.support(methods::GET, [&callback_received](http_request request) {
+          request.reply(status_codes::OK,
+                        U("<html><head><title>Logged Out</title></head><body style=\"font-family: sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0;\"><div style=\"text-align: center;\"><h1>Logged Out Successfully</h1><p>You may close this window and return to the application.</p></div></body></html>"),
+                        U("text/html"));
+          callback_received = true;
+        });
+
+        logout_listener.open().wait();
+
+        // Build logout URL to clear Auth0 session
+        std::ostringstream logoutUrl;
+        logoutUrl << "https://" << domain << "/v2/logout?"
+                  << "client_id=" << clientId
+                  << "&returnTo=http%3A%2F%2Flocalhost%3A43828%2Flogout";
+
+        if (federated) {
+          logoutUrl << "&federated";
+        }
+
+        // Open logout URL in browser to clear session
+        std::string openCommand = "xdg-open '" + logoutUrl.str() + "' &";
+        system(openCommand.c_str());
+
+        // Wait for callback with timeout
+        int timeout_ms = 30000;
+        int elapsed = 0;
+        const int sleep_ms = 50;
+        while (!callback_received && elapsed < timeout_ms) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(sleep_ms));
+          elapsed += sleep_ms;
+        }
+
+        logout_listener.close().wait();
+
+        async_response = FL_METHOD_RESPONSE(fl_method_success_response_new(fl_value_new_null()));
+      } catch (const std::exception& e) {
+        async_response = FL_METHOD_RESPONSE(fl_method_error_response_new(
+            "logout_failed", e.what(), nullptr));
+      }
+
+      // Send response back on main thread
+      AsyncResponse* data = new AsyncResponse{method_call, async_response};
+      g_idle_add(send_async_response, data);
+    }).detach();
+
+    return; // Don't respond synchronously
   } else {
     response = FL_METHOD_RESPONSE(fl_method_not_implemented_response_new());
   }
